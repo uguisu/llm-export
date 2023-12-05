@@ -1,22 +1,21 @@
-import argparse
+import os
 import base64
 import glob
-import os
 import shutil
-
+import argparse
+import torch
 import numpy as np
 import onnx
 import onnxruntime as ort
 import sentencepiece as spm
-import torch
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
-
 
 # some wrapper class for export
 class Embedding(torch.nn.Module):
     def __init__(self, embed, using_bf16: bool = False, hidden_size: int = 4096):
         super().__init__()
         self.bf16 = using_bf16
+        self.embed_dim = embed.weight.shape[-1]
         if using_bf16:
             # using bf16 embedding weight
             self.embed = embed.bfloat16()
@@ -28,7 +27,7 @@ class Embedding(torch.nn.Module):
         res = self.embed(input_ids)
         if self.bf16:
             res = res.float()
-        return res.view(-1, 1, self.hidden_size)
+        return res.view(-1, 1, self.embed_dim)
 
 class Lm(torch.nn.Module):
     def __init__(self, lm):
@@ -56,8 +55,9 @@ class LLM(torch.nn.Module):
             self.sp_model = spm.SentencePieceProcessor(tokenizer_model)
         else:
             self.sp_model = None
-        self.load_model(args.path)
         self.max_length = 1024
+        self.hidden_size = 4096
+        self.load_model(args.path)
 
     def load_model(self, model_path: str):
         raise NotImplementedError
@@ -316,7 +316,7 @@ class GLMBlock(torch.nn.Module):
                                              use_cache=True)
         if self.final_layernorm is not None:
             hidden_states = self.final_layernorm(hidden_states)
-            hidden_states = hidden_states.view(-1, 4096)[-1].view(1, 1, 4096)
+            hidden_states = hidden_states.view(-1, self.hidden_size)[-1].view(1, 1, self.hidden_size)
         if isinstance(presents, tuple):
             presents = torch.stack(presents)
         return hidden_states, presents
@@ -398,7 +398,7 @@ class GLM2Block(torch.nn.Module):
                                             rotary_pos_emb=rotary_pos_emb)
         if self.final_layernorm is not None:
             hidden_states = self.final_layernorm(hidden_states)
-            hidden_states = hidden_states.view(-1, 4096)[-1].view(1, 1, 4096)
+            hidden_states = hidden_states.view(-1, self.hidden_size)[-1].view(1, 1, self.hidden_size)
         if isinstance(presents, tuple):
             presents = torch.stack(presents)
         return hidden_states, presents
@@ -464,11 +464,12 @@ class Chatglm3_6b(Chatglm2_6b):
 
 # qwen
 class QWENBlock(torch.nn.Module):
-    def __init__(self, block, block_id, final_layernorm = None):
+    def __init__(self, block, block_id, hidden_size, final_layernorm = None):
         super().__init__()
         self.block = block
         self.block_id = block_id
         self.final_layernorm = final_layernorm
+        self.hidden_size = hidden_size
 
     def forward(self, hidden_states, attention_mask, position_ids, past_kv):
         theta = 1.0 / (10000.0 ** (torch.arange(0, 128, 2, dtype=torch.float32) / 128))
@@ -476,7 +477,7 @@ class QWENBlock(torch.nn.Module):
         idx_theta = position_ids * theta
         rotary_pos_emb = torch.cat((idx_theta, idx_theta), dim=-1)
         rotary_pos_emb = rotary_pos_emb.unsqueeze(1).unsqueeze(0)
-        hidden_states = hidden_states.view(1, -1, 4096)
+        hidden_states = hidden_states.view(1, -1, self.hidden_size)
         hidden_states, presents = self.block(hidden_states,
                                              past_kv,
                                              attention_mask,
@@ -484,7 +485,34 @@ class QWENBlock(torch.nn.Module):
                                              use_cache=True)
         if self.final_layernorm is not None:
             hidden_states = self.final_layernorm(hidden_states)
-            hidden_states = hidden_states.view(-1, 4096)[-1].view(1, 1, 4096)
+            hidden_states = hidden_states.view(-1, self.hidden_size)[-1].view(1, 1, self.hidden_size)
+        if isinstance(presents, tuple):
+            presents = torch.stack(presents)
+        return hidden_states, presents
+
+class QWEN18Block(torch.nn.Module):
+    def __init__(self, block, block_id, hidden_size, final_layernorm = None):
+        super().__init__()
+        self.block = block
+        self.block_id = block_id
+        self.final_layernorm = final_layernorm
+        self.hidden_size = hidden_size
+
+    def forward(self, hidden_states, attention_mask, position_ids, past_kv):
+        theta = 1.0 / (10000.0 ** (torch.arange(0, 128, 2, dtype=torch.float32) / 128))
+        position_ids = position_ids.float().reshape(-1, 1)
+        idx_theta = position_ids * theta
+        rotary_pos_emb = torch.cat((idx_theta, idx_theta), dim=-1).unsqueeze(1).unsqueeze(0)
+        rotary_pos_emb = torch.stack([torch.cos(rotary_pos_emb), torch.sin(rotary_pos_emb)])
+        hidden_states = hidden_states.view(1, -1, self.hidden_size)
+        hidden_states, presents = self.block(hidden_states,
+                                             rotary_pos_emb,
+                                             past_kv,
+                                             attention_mask,
+                                             use_cache=True)
+        if self.final_layernorm is not None:
+            hidden_states = self.final_layernorm(hidden_states)
+            hidden_states = hidden_states.view(-1, self.hidden_size)[-1].view(1, 1, self.hidden_size)
         if isinstance(presents, tuple):
             presents = torch.stack(presents)
         return hidden_states, presents
@@ -504,11 +532,18 @@ class Qwen_7b_Chat(LLM):
         # some wrapper
         self.stop_id = self.tokenizer.im_end_id
         self.block_nums = len(self.blocks_)
+        self.hidden_size = transformer.embed_dim
         self.embed = Embedding(self.embed_, self.embed_bf16)
         self.lm = Lm(self.lm_)
-        self.blocks = [QWENBlock(self.blocks_[i], i, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
+        if self.block_nums == 32:
+            # qwen-7b
+            self.blocks = [QWENBlock(self.blocks_[i], i, self.hidden_size, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
+            self.past_kv_shape = [32, 2, 1, 0, 32, 128]
+        elif self.block_nums == 24:
+            # qwen-1.8b
+            self.blocks = [QWEN18Block(self.blocks_[i], i, self.hidden_size, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
+            self.past_kv_shape = [24, 2, 1, 0, 16, 128]
         # some config for export
-        self.past_kv_shape = [32, 2, 1, 0, 32, 128]
         self.block_dynamic_axes = {
             "inputs_embeds" : { 0: "seq_len" },
             "attention_mask" : { 2: "seq_len", 3: "seq_len" },
@@ -764,6 +799,7 @@ if __name__ == '__main__':
         'chatglm3-6b': Chatglm3_6b,
         'codegeex2-6b': Chatglm2_6b,
         'Qwen-7B-Chat': Qwen_7b_Chat,
+        'Qwen_edge': Qwen_7b_Chat,
         'Baichuan2-7B-Chat': Llama2_7b_Chat,
         'Baichuan2-13B-Chat': Baichuan2_13b_Chat,
         'Llama-2-7b-chat-ms': Llama2_7b_Chat
