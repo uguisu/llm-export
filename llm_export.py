@@ -799,7 +799,7 @@ if __name__ == '__main__':
         'chatglm3-6b': Chatglm3_6b,
         'codegeex2-6b': Chatglm2_6b,
         'Qwen-7B-Chat': Qwen_7b_Chat,
-        'Qwen_edge': Qwen_7b_Chat,
+        'Qwen-1_8B-Chat': Qwen_7b_Chat,
         'Baichuan2-7B-Chat': Llama2_7b_Chat,
         'Baichuan2-13B-Chat': Baichuan2_13b_Chat,
         'Llama-2-7b-chat-ms': Llama2_7b_Chat
