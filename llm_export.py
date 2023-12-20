@@ -36,7 +36,7 @@ def onnx2mnn(onnx_path, mnn_dir, quant_bit = 4, asymmetric = True, external_data
 
 # some wrapper class for export
 class Embedding(torch.nn.Module):
-    def __init__(self, embed, using_bf16: bool = False, hidden_size: int = 4096):
+    def __init__(self, embed, using_bf16: bool = False):
         super().__init__()
         self.bf16 = using_bf16
         self.embed_dim = embed.weight.shape[-1]
@@ -45,7 +45,6 @@ class Embedding(torch.nn.Module):
             self.embed = embed.bfloat16()
         else:
             self.embed = embed
-        self.hidden_size = hidden_size
 
     def forward(self, input_ids):
         res = self.embed(input_ids)
@@ -425,6 +424,7 @@ class GLM2Block(torch.nn.Module):
         self.block = block
         self.block_id = block_id
         self.final_layernorm = final_layernorm
+        self.hidden_size = 4096
 
     def forward(self, hidden_states, attention_mask, position_ids, past_kv):
         theta = 1.0 / (10000 ** (torch.arange(0, 64, 2, dtype=torch.float32) / 64))
@@ -683,6 +683,74 @@ class Llama2_7b_Chat(LLM):
             return torch.tensor([[self.seq_len - 1]], dtype=torch.long)
         return torch.arange(self.seq_len, dtype=torch.long).unsqueeze(0)
 
+class PHI2Block(torch.nn.Module):
+    def __init__(self, block, block_id, hidden_size):
+        super().__init__()
+        self.block = block
+        self.block_id = block_id
+        self.hidden_size = hidden_size
+
+    def forward(self, hidden_states, attention_mask, position_ids, past_kv):
+        hidden_states = hidden_states.view(1, -1, self.hidden_size)
+        hidden_states, presents = self.block(hidden_states,
+                                             past_kv,
+                                             attention_mask)
+        if isinstance(presents, tuple):
+            presents = torch.stack(presents)
+        return hidden_states, presents
+
+class phi_2(LLM):
+    def __init__(self, args):
+        super().__init__(args)
+        self.model_name = 'phi-2'
+
+    def load_model(self, model_path: str):
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True).float().eval()
+        transformer = model.transformer
+        print(transformer)
+        self.lm_ = model.lm_head
+        self.embed_ = transformer.embd.wte
+        self.hidden_size = self.embed_.weight.shape[-1]
+        self.blocks_ = transformer.h
+        # self.final_layernorm_ = transformer.final_layernorm
+        # some wrapper
+        self.stop_id = self.tokenizer.eos_token_id
+        self.block_nums = len(self.blocks_)
+        self.embed = Embedding(self.embed_, self.embed_bf16)
+        self.lm = Lm(self.lm_)
+        self.blocks = [PHI2Block(self.blocks_[i], i, self.hidden_size) for i in range(self.block_nums)]
+        # some config for export
+        self.past_kv_shape = [32, 2, 1, 32, 0, 128]
+        self.block_dynamic_axes = {
+            "inputs_embeds" : { 0: "seq_len" },
+            "attention_mask" : { 2: "seq_len", 3: "seq_len" },
+            "position_ids" : { 0: "seq_len" },
+            "past_key_values" : { 3: "history_len" }
+        }
+        self.model_dynamic_axes = {
+            "input_ids" : { 0: "seq_len" },
+            "attention_mask" : { 2: "seq_len", 3: "seq_len" },
+            "position_ids" : { 0: "seq_len" },
+            "past_key_values" : { 4: "history_len" }
+        }
+
+    def build_prompt(self, query):
+        if 'Baichuan2' in self.model_name:
+            return f'<reserved_106>{query}<reserved_107>'
+        return f'[INST]{query}[/INST]'
+
+
+    def get_attention_mask(self) -> torch.Tensor:
+        if self.token_len:
+            return torch.zeros([1, 1, 1, self.seq_len], dtype=torch.float32)
+        return (1 - torch.tril(torch.ones([1, 1, self.seq_len, self.seq_len]))) * torch.finfo(torch.float32).min
+
+    def get_position_ids(self) -> torch.Tensor:
+        if self.token_len:
+            return torch.tensor([[self.seq_len - 1]], dtype=torch.long)
+        return torch.arange(self.seq_len, dtype=torch.long).unsqueeze(0)
+
 
 # baichuan2_13b
 class Baichuan2_13b_Block(torch.nn.Module):
@@ -841,7 +909,9 @@ if __name__ == '__main__':
         'Qwen-1_8B-Chat': Qwen_7b_Chat,
         'Baichuan2-7B-Chat': Llama2_7b_Chat,
         'Baichuan2-13B-Chat': Baichuan2_13b_Chat,
-        'Llama-2-7b-chat-ms': Llama2_7b_Chat
+        'Llama-2-7b-chat-ms': Llama2_7b_Chat,
+        'Llama-2-7b-chat-ms': Llama2_7b_Chat,
+        'phi-2': phi_2
     }
     parser = argparse.ArgumentParser(description='LLMExporter', formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument('--path', type=str, default='THUDM/chatglm-6b', required=True,
@@ -896,7 +966,6 @@ if __name__ == '__main__':
 
     if args.export:
         llm_exporter.export()
-        llm_exporter.verify_load_via_onnx()
 
     if args.export_token:
         llm_exporter.export_tokenizer()
