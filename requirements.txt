@@ -1,9 +1,11 @@
-MNN==2.8.0
+MNN==2.8.1
 numpy==1.26.2
 onnxruntime==1.16.1
 torch==2.1.1
 transformers==4.33.2
-transformers_stream_generator==0.0.4
+transformers-stream-generator==0.0.4
 sentencepiece==0.1.99
 accelerate==0.24.1
 onnx==1.15.0
+onnxslim
+peft==0.9.0
