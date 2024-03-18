@@ -5,14 +5,42 @@ import shutil
 import argparse
 import torch
 import numpy as np
+from onnxslim import slim
 import onnx
 import onnxruntime as ort
+import _tools as MNNTools
 import sentencepiece as spm
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
+def onnx2mnn(onnx_path, mnn_dir, quant_bit = 4, asymmetric = True, external_data = False, bizCode : str= None):
+    model_name, model_extension = os.path.splitext(os.path.basename(onnx_path))
+    if model_extension != '.onnx':
+        return
+    mnn_name = model_name + '.mnn'
+    mnn_path = os.path.join(mnn_dir, mnn_name)
+    convert_args = [
+        '',
+        '-f',
+        'ONNX',
+        '--modelFile',
+        str(onnx_path),
+        '--MNNModel',
+        str(mnn_path),
+        '--weightQuantBits',
+        str(quant_bit),
+    ]
+    if asymmetric:
+        convert_args.append("--weightQuantAsymmetric")
+    if external_data:
+        convert_args.append("--saveExternalData")
+    if bizCode is not None:
+        convert_args.append("--bizCode")
+        convert_args.append(str(bizCode))
+    MNNTools.mnnconvert(convert_args)
+
 # some wrapper class for export
 class Embedding(torch.nn.Module):
-    def __init__(self, embed, using_bf16: bool = False, hidden_size: int = 4096):
+    def __init__(self, embed, using_bf16: bool = False):
         super().__init__()
         self.bf16 = using_bf16
         self.embed_dim = embed.weight.shape[-1]
@@ -21,7 +49,6 @@ class Embedding(torch.nn.Module):
             self.embed = embed.bfloat16()
         else:
             self.embed = embed
-        self.hidden_size = hidden_size
 
     def forward(self, input_ids):
         res = self.embed(input_ids)
@@ -46,17 +73,28 @@ class LLM(torch.nn.Module):
 
     def __init__(self, args):
         super().__init__()
-        self.export_path = args.export_path
+        self.quant_bit = 4
+        self.asymmetric = True
+        self.onnx_path = args.onnx_path
+        self.mnn_path = args.mnn_path
+        if not os.path.exists(self.onnx_path):
+            os.makedirs(self.onnx_path)
+        if not os.path.exists(self.mnn_path):
+            os.makedirs(self.mnn_path)
+        self.export_mnn = args.export_mnn
         self.export_verbose = args.export_verbose
         self.export_test = args.export_test
         self.embed_bf16 = args.embed_bf16
+        self.skip_slim = args.skip_slim
         tokenizer_model = os.path.join(args.path, 'tokenizer.model')
         if os.path.exists(tokenizer_model):
             self.sp_model = spm.SentencePieceProcessor(tokenizer_model)
         else:
             self.sp_model = None
+        self.stop_ids = []
         self.max_length = 1024
         self.hidden_size = 4096
+        self.visual = None # defualt is not visual
         self.load_model(args.path)
 
     def load_model(self, model_path: str):
@@ -71,8 +109,14 @@ class LLM(torch.nn.Module):
     def export_vocab(self):
         raise NotImplementedError
 
+    def visual_embed(self, input_ids):
+        raise NotImplementedError
+
     def forward(self, input_ids, attention_mask, position_ids, past_key_values):
-        hidden_states = self.embed(input_ids)
+        if self.visual is not None and past_key_values[0] is None:
+            hidden_states = self.visual_embed(input_ids)
+        else:
+            hidden_states = self.embed(input_ids)
         presents = []
         for i in range(self.block_nums):
             hidden_states, kv = self.blocks[i](hidden_states, attention_mask, position_ids, past_key_values[i])
@@ -112,7 +156,7 @@ class LLM(torch.nn.Module):
             attention_mask = self.get_attention_mask()
             position_ids = self.get_position_ids()
             token_id, past_key_values = self.forward(token_id, attention_mask, position_ids, past_key_values)
-            if token_id == self.stop_id:
+            if token_id == self.stop_id or token_id in self.stop_ids:
                 print("", end='\n')
                 break
             word = self.id_to_str(token_id)
@@ -136,7 +180,7 @@ class LLM(torch.nn.Module):
     def export_lm(self):
         model = self.lm
         hidden_states = torch.randn(1, self.hidden_size)
-        onnx_model = f'./{self.export_path}/lm.onnx'
+        onnx_model = f'./{self.onnx_path}/lm.onnx'
         torch.onnx.export(model, (hidden_states),
                         onnx_model,
                         verbose=self.export_verbose,
@@ -144,6 +188,8 @@ class LLM(torch.nn.Module):
                         output_names=['token_id'],
                         do_constant_folding=True,
                         opset_version=15)
+        if not self.skip_slim:
+            slim(onnx_model, output_model=onnx_model)
         # test lm
         if self.export_test:
             original_outs = model(hidden_states)
@@ -153,11 +199,43 @@ class LLM(torch.nn.Module):
             }
             onnx_outs = ort_session.run(None, inputs)
             self.assert_equal(original_outs, onnx_outs)
+        if self.export_mnn:
+            onnx2mnn(onnx_model, self.mnn_path, self.quant_bit, self.asymmetric)
+
+    def export_visual(self):
+        if self.visual is None:
+            return
+        input_images = torch.randn((1, 3, self.image_size, self.image_size))
+        model = self.visual
+        onnx_model = f'./{self.onnx_path}/visual.onnx'
+        torch.onnx.export(model, (input_images),
+                        onnx_model,
+                        verbose=self.export_verbose,
+                        input_names=['input_images'],
+                        output_names=['image_embeds'],
+                        dynamic_axes={"input_images": {
+                            0: "size"
+                        }},
+                        do_constant_folding=True,
+                        opset_version=15)
+        if not self.skip_slim:
+            slim(onnx_model, output_model=onnx_model)
+        # test
+        if self.export_test:
+            original_outs = model(input_images)
+            ort_session = ort.InferenceSession(onnx_model, providers=['CPUExecutionProvider'])
+            inputs = {
+                'input_images' : input_images.numpy(),
+            }
+            onnx_outs = ort_session.run(None, inputs)[0]
+            self.assert_equal(original_outs, onnx_outs)
+        if self.export_mnn:
+            onnx2mnn(onnx_model, self.mnn_path)
 
     def export_embed(self):
         model = self.embed
         input_ids = torch.arange(3, dtype=torch.long)
-        onnx_model = f'./{self.export_path}/embedding.onnx'
+        onnx_model = f'./{self.onnx_path}/embedding.onnx'
         torch.onnx.export(model, (input_ids),
                         onnx_model,
                         verbose=self.export_verbose,
@@ -168,6 +246,8 @@ class LLM(torch.nn.Module):
                         }},
                         do_constant_folding=True,
                         opset_version=15)
+        if not self.skip_slim:
+            slim(onnx_model, output_model=onnx_model)
         # test
         if self.export_test:
             original_outs = model(input_ids)
@@ -177,6 +257,8 @@ class LLM(torch.nn.Module):
             }
             onnx_outs = ort_session.run(None, inputs)
             self.assert_equal(original_outs, onnx_outs)
+        if self.export_mnn:
+            onnx2mnn(onnx_model, self.mnn_path)
 
     def export_block(self, block_id: int):
         self.seq_len = 3
@@ -186,7 +268,7 @@ class LLM(torch.nn.Module):
         position_ids = self.get_position_ids()
         past_key_values = torch.zeros(self.past_kv_shape[1:])
         model = self.blocks[block_id]
-        onnx_model = f'./{self.export_path}/block_{block_id}.onnx'
+        onnx_model = f'./{self.onnx_path}/block_{block_id}.onnx'
         torch.onnx.export(
             model, (inputs_embeds, attention_mask, position_ids, past_key_values),
             onnx_model,
@@ -198,6 +280,8 @@ class LLM(torch.nn.Module):
             dynamic_axes=self.block_dynamic_axes,
             do_constant_folding=True,
             opset_version=15)
+        if not self.skip_slim:
+            slim(onnx_model, output_model=onnx_model)
         if self.export_test:
             original_outs = model(inputs_embeds, attention_mask, position_ids, past_key_values)
             ort_session = ort.InferenceSession(onnx_model, providers=['CPUExecutionProvider'])
@@ -209,6 +293,8 @@ class LLM(torch.nn.Module):
             }
             onnx_outs = ort_session.run(None, inputs)
             self.assert_equal(original_outs, onnx_outs)
+        if self.export_mnn:
+            onnx2mnn(onnx_model, self.mnn_path, self.quant_bit, self.asymmetric)
 
     def export_blocks(self):
         for i in range(self.block_nums):
@@ -222,7 +308,7 @@ class LLM(torch.nn.Module):
         attention_mask =  self.get_attention_mask()
         position_ids = self.get_position_ids()
         past_key_values = torch.zeros(self.past_kv_shape)
-        onnx_model = f'./{self.export_path}/llm.onnx'
+        onnx_model = f'./{self.onnx_path}/llm.onnx'
         torch.onnx.export(
             model, (input_ids, attention_mask, position_ids, past_key_values),
             onnx_model,
@@ -234,6 +320,8 @@ class LLM(torch.nn.Module):
             dynamic_axes=self.model_dynamic_axes,
             do_constant_folding=True,
             opset_version=15)
+        if not self.skip_slim:
+            slim(onnx_model, output_model=onnx_model)
         if self.export_test:
             # test
             original_outs = model(input_ids, attention_mask, position_ids, past_key_values)
@@ -246,9 +334,12 @@ class LLM(torch.nn.Module):
             }
             onnx_outs = ort_session.run(None, inputs)
             self.assert_equal(original_outs, onnx_outs)
+        if self.export_mnn:
+            # single model is > 2G, using external_data
+            onnx2mnn(onnx_model, self.mnn_path, self.quant_bit, self.asymmetric, True)
 
     def export_tokenizer(self):
-        file_path = os.path.join(self.export_path, "tokenizer.txt")
+        file_path = os.path.join(self.onnx_path, "tokenizer.txt")
         if self.sp_model is not None:
             # senetencepiece
             NORMAL = 1; UNKNOWN = 2; CONTROL = 3
@@ -274,11 +365,40 @@ class LLM(torch.nn.Module):
                 token_encode = base64.b64encode(token.encode("utf-8")).decode("utf8")
                 fp.write(f'{token_encode} {score} {type}\n')
             fp.close()
-        else:
+        elif hasattr(self.tokenizer, 'mergeable_ranks'):
             # tikton
             with open(file_path, "w", encoding="utf8") as fp:
                 for k, v in self.tokenizer.mergeable_ranks.items():
                     line = base64.b64encode(k).decode("utf8") + "\n"
+                    fp.write(line)
+                if hasattr(self.tokenizer, 'special_tokens'):
+                    for k, v in self.tokenizer.special_tokens.items():
+                        line = base64.b64encode(k.encode("utf-8")).decode("utf8") + "\n"
+                        fp.write(line)
+        else:
+            # huggingface tokenizer
+            def unicode_to_byte(u: int):
+                if u >= 256 and u <= 288:
+                    return u - 256
+                if u >= 289 and u <= 322:
+                    return u - 162
+                if u == 323:
+                    return 173
+                if u == 65372: # |
+                    return 124
+                if u == 9601:  # _
+                    return 95
+                return u
+            with open(file_path, "w", encoding="utf8") as fp:
+                vocab = self.tokenizer.get_vocab()
+                vocab_list = ['<unk>' for i in range(len(vocab))]
+                for k, v in vocab.items():
+                    try:
+                        vocab_list[int(v)] = bytes([unicode_to_byte(ord(c)) for c in k]).decode('utf-8', errors='ignore')
+                    except:
+                        vocab_list[int(v)] = k
+                for v in vocab_list:
+                    line = base64.b64encode(v.encode('utf-8')).decode("utf8") + "\n"
                     fp.write(line)
 
     def verify_load_via_onnx(self):
@@ -386,6 +506,7 @@ class GLM2Block(torch.nn.Module):
         self.block = block
         self.block_id = block_id
         self.final_layernorm = final_layernorm
+        self.hidden_size = 4096
 
     def forward(self, hidden_states, attention_mask, position_ids, past_kv):
         theta = 1.0 / (10000 ** (torch.arange(0, 64, 2, dtype=torch.float32) / 64))
@@ -464,8 +585,9 @@ class Chatglm3_6b(Chatglm2_6b):
 
 # qwen
 class QWENBlock(torch.nn.Module):
-    def __init__(self, block, block_id, hidden_size, final_layernorm = None):
+    def __init__(self, name, block, block_id, hidden_size, final_layernorm = None):
         super().__init__()
+        self.name = name
         self.block = block
         self.block_id = block_id
         self.final_layernorm = final_layernorm
@@ -477,11 +599,13 @@ class QWENBlock(torch.nn.Module):
         idx_theta = position_ids * theta
         rotary_pos_emb = torch.cat((idx_theta, idx_theta), dim=-1)
         rotary_pos_emb = rotary_pos_emb.unsqueeze(1).unsqueeze(0)
+        if self.name != 'Qwen-7B':
+            rotary_pos_emb = torch.stack([torch.cos(rotary_pos_emb), torch.sin(rotary_pos_emb)])
         hidden_states = hidden_states.view(1, -1, self.hidden_size)
-        hidden_states, presents = self.block(hidden_states,
-                                             past_kv,
-                                             attention_mask,
-                                             rotary_pos_emb,
+        hidden_states, presents = self.block(hidden_states=hidden_states,
+                                             layer_past=past_kv,
+                                             attention_mask=attention_mask,
+                                             rotary_pos_emb=rotary_pos_emb,
                                              use_cache=True)
         if self.final_layernorm is not None:
             hidden_states = self.final_layernorm(hidden_states)
@@ -517,31 +641,40 @@ class QWEN18Block(torch.nn.Module):
             presents = torch.stack(presents)
         return hidden_states, presents
 
-class Qwen_7b_Chat(LLM):
+class Qwen_Chat(LLM):
     def __init__(self, args):
         super().__init__(args)
 
     def load_model(self, model_path: str):
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True).float().eval()
+        # Qwen models
+        self.model_name = 'Qwen-7B'
+        if '1_8' in model_path:
+            self.model_name = 'Qwen-1_8b'
+        if 'VL' in model_path:
+            self.model_name = 'Qwen-VL'
         transformer = model.transformer
         self.lm_ = model.lm_head
         self.embed_ = transformer.wte
         self.blocks_ = transformer.h
         self.final_layernorm_ = transformer.ln_f
+        if hasattr(transformer, 'visual'):
+            self.visual = transformer.visual
+            self.image_start_id = transformer.config.visual['image_start_id']
+            self.image_size = transformer.config.visual['image_size']
         # some wrapper
         self.stop_id = self.tokenizer.im_end_id
         self.block_nums = len(self.blocks_)
         self.hidden_size = transformer.embed_dim
         self.embed = Embedding(self.embed_, self.embed_bf16)
         self.lm = Lm(self.lm_)
+        self.blocks = [QWENBlock(self.model_name, self.blocks_[i], i, self.hidden_size, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
         if self.block_nums == 32:
-            # qwen-7b
-            self.blocks = [QWENBlock(self.blocks_[i], i, self.hidden_size, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
+            # qwen-7b, qwen-vl
             self.past_kv_shape = [32, 2, 1, 0, 32, 128]
         elif self.block_nums == 24:
             # qwen-1.8b
-            self.blocks = [QWEN18Block(self.blocks_[i], i, self.hidden_size, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
             self.past_kv_shape = [24, 2, 1, 0, 16, 128]
         # some config for export
         self.block_dynamic_axes = {
@@ -561,6 +694,10 @@ class Qwen_7b_Chat(LLM):
         return f'\n<|im_start|>user\n{query}<|im_end|>\n<|im_start|>assistant\n'
 
     def get_attention_mask(self) -> torch.Tensor:
+        if self.model_name == 'Qwen-VL':
+            if self.token_len:
+                return torch.zeros([1, 1, 1, self.seq_len], dtype=torch.float32)
+            return (1 - torch.tril(torch.ones([1, 1, self.seq_len, self.seq_len]))) * torch.finfo(torch.float32).min
         if self.token_len:
             return torch.ones([1, 1, 1, 1]).bool()
         return torch.tril(torch.ones([1, 1, self.seq_len, self.seq_len]).bool())
@@ -570,16 +707,34 @@ class Qwen_7b_Chat(LLM):
             return torch.tensor([self.seq_len - 1], dtype=torch.long)
         return torch.arange(self.seq_len, dtype=torch.long)
 
+    def visual_embed(self, input_ids):
+        if not torch.any(input_ids == self.image_start_id):
+            return self.embed(input_ids)
+        bos_pos = torch.where(input_ids == self.image_start_id)
+        eos_pos = torch.where(input_ids == self.image_start_id + 1)
+        img_pos = torch.stack((bos_pos[0], bos_pos[1], eos_pos[1]), dim=1)
+        images = []
+        for i, a, b in img_pos:
+            image = input_ids[i][a + 1 : b - 1].tolist()
+            image = image[ : image.index(self.image_start_id + 2)]
+            images.append(bytes(image).decode('utf-8'))
+        images = self.visual.encode(images)
+        hidden_states = self.embed(input_ids).view(1, -1, self.hidden_size)
+        for idx, (i, a, b) in enumerate(img_pos):
+            hidden_states[i][a + 1 : b] = images[idx]
+        return hidden_states.view(-1, 1, self.hidden_size)
+
 # llama2
 class LLAMA2Block(torch.nn.Module):
-    def __init__(self, block, block_id, final_layernorm = None):
+    def __init__(self, block, block_id, hidden_size, final_layernorm = None):
         super().__init__()
         self.block = block
         self.block_id = block_id
         self.final_layernorm = final_layernorm
+        self.hidden_size = hidden_size
 
     def forward(self, hidden_states, attention_mask, position_ids, past_kv):
-        hidden_states = hidden_states.view(1, -1, 4096)
+        hidden_states = hidden_states.view(1, -1, self.hidden_size)
         hidden_states, presents = self.block(hidden_states,
                                              attention_mask,
                                              position_ids,
@@ -587,17 +742,25 @@ class LLAMA2Block(torch.nn.Module):
                                              use_cache=True)
         if self.final_layernorm is not None:
             hidden_states = self.final_layernorm(hidden_states)
-            hidden_states = hidden_states.view(-1, 4096)[-1].view(1, 1, 4096)
+            hidden_states = hidden_states.view(-1, self.hidden_size)[-1].view(1, 1, self.hidden_size)
         if isinstance(presents, tuple):
             presents = torch.stack(presents)
         return hidden_states, presents
 
 class Llama2_7b_Chat(LLM):
     def __init__(self, args):
-        super().__init__(args)
         self.model_name = 'Llama2_7b'
         if 'Baichuan2' in args.path:
             self.model_name = 'Baichuan2_7B'
+        if 'internlm' in args.path:
+            self.model_name = 'Internlm_7b'
+        if 'TinyLlama' in args.path:
+            self.model_name = 'TinyLlama'
+        if 'Yi' in args.path:
+            self.model_name = 'Yi'
+        if 'deepseek' in args.path:
+            self.model_name = 'deepseek'
+        super().__init__(args)
 
     def load_model(self, model_path: str):
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -608,13 +771,21 @@ class Llama2_7b_Chat(LLM):
         self.blocks_ = transformer.layers
         self.final_layernorm_ = transformer.norm
         # some wrapper
+        self.hidden_size = self.embed_.weight.shape[-1]
         self.stop_id = self.tokenizer.eos_token_id
+        if hasattr(model, 'generation_config'):
+            self.stop_ids.append(self.stop_id)
+            self.stop_ids.append(model.generation_config.eos_token_id)
         self.block_nums = len(self.blocks_)
         self.embed = Embedding(self.embed_, self.embed_bf16)
         self.lm = Lm(self.lm_)
-        self.blocks = [LLAMA2Block(self.blocks_[i], i, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
+        self.blocks = [LLAMA2Block(self.blocks_[i], i, self.hidden_size, self.final_layernorm_ if i == len(self.blocks_) - 1 else None) for i in range(self.block_nums)]
         # some config for export
         self.past_kv_shape = [32, 2, 1, 32, 0, 128]
+        if 'Yi' in self.model_name:
+            self.past_kv_shape = [32, 2, 1, 4, 0, 128]
+        if self.block_nums == 22:
+            self.past_kv_shape = [22, 2, 1, 4, 0, 64]
         self.block_dynamic_axes = {
             "inputs_embeds" : { 0: "seq_len" },
             "attention_mask" : { 2: "seq_len", 3: "seq_len" },
@@ -631,6 +802,14 @@ class Llama2_7b_Chat(LLM):
     def build_prompt(self, query):
         if 'Baichuan2' in self.model_name:
             return f'<reserved_106>{query}<reserved_107>'
+        if 'Internlm_7b' in self.model_name:
+            return f'<|User|>:{query}<eoh>\n<|Bot|>:'
+        if 'TinyLlama' in self.model_name:
+            return f'<s><|system|>\nYou are a friendly chatbot who always responds in the style of a pirate</s>\n<|user|>\n{query}</s>\n<|assistant|>\n'
+        if 'Yi' in self.model_name:
+            return f'<|im_start|> user\n{query}<|im_end|>\n<|im_start|> assistant\n'
+        if 'deepseek' in self.model_name:
+            return f'<|begin▁of▁sentence|>User: {query}\nAssistant:'
         return f'[INST]{query}[/INST]'
 
 
@@ -644,6 +823,211 @@ class Llama2_7b_Chat(LLM):
             return torch.tensor([[self.seq_len - 1]], dtype=torch.long)
         return torch.arange(self.seq_len, dtype=torch.long).unsqueeze(0)
 
+# phi-2
+class PHI2Block(torch.nn.Module):
+    def __init__(self, block, block_id, hidden_size):
+        super().__init__()
+        self.block = block
+        self.block_id = block_id
+        self.hidden_size = hidden_size
+
+    def forward(self, hidden_states, attention_mask, position_ids, past_kv):
+        theta = 1.0 / (10000 ** (torch.arange(0, 32, 2, dtype=torch.float32) / 32))
+        position_ids = position_ids.float().reshape(-1, 1)
+        idx_theta = position_ids * theta
+        rotary_pos_emb = torch.stack([torch.cos(idx_theta), torch.sin(idx_theta)], dim=0).contiguous()
+        hidden_states = hidden_states.view(1, -1, self.hidden_size)
+        hidden_states, presents = self.block(hidden_states,
+                                             past_kv,
+                                             rotary_pos_emb=rotary_pos_emb,
+                                             causal_mask=attention_mask
+                                             )
+        if self.block_id == 31:
+            hidden_states = hidden_states[:, -1, :]
+        return hidden_states, presents
+
+class phi_2(LLM):
+    def __init__(self, args):
+        super().__init__(args)
+        self.model_name = 'phi-2'
+        self.asymmetric = False # TODO: some precision bug when using asymmetric
+
+    def load_model(self, model_path: str):
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True).float().eval()
+        transformer = model.transformer
+        self.lm_ = model.lm_head
+        self.embed_ = transformer.embd.wte
+        self.hidden_size = self.embed_.weight.shape[-1]
+        self.blocks_ = transformer.h
+        # self.final_layernorm_ = transformer.final_layernorm
+        # some wrapper
+        self.stop_id = self.tokenizer.eos_token_id
+        self.block_nums = len(self.blocks_)
+        self.embed = Embedding(self.embed_, self.embed_bf16)
+        self.lm = Lm(self.lm_)
+        self.blocks = [PHI2Block(self.blocks_[i], i, self.hidden_size) for i in range(self.block_nums)]
+        # some config for export
+        self.past_kv_shape = [len(self.blocks), 1, 0, 2, 32, 80]
+        self.block_dynamic_axes = {
+            "inputs_embeds" : { 0: "seq_len" },
+            "attention_mask" : { 2: "seq_len", 3: "seq_len" },
+            "position_ids" : { 0: "seq_len" },
+            "past_key_values" : { 1: "history_len" }
+        }
+        self.model_dynamic_axes = {
+            "input_ids" : { 0: "seq_len" },
+            "attention_mask" : { 2: "seq_len", 3: "seq_len" },
+            "position_ids" : { 0: "seq_len" },
+            "past_key_values" : { 2: "history_len" }
+        }
+
+    def build_prompt(self, query):
+            return f'Instruct: {query}\nOutput:'
+
+    def get_attention_mask(self) -> torch.Tensor:
+        if self.token_len:
+            return torch.zeros([1, 1, 1, 1]).bool()
+        attention_mask = ~torch.tril(torch.ones([1, 1, self.seq_len, self.seq_len]).bool())
+        return attention_mask
+
+    def get_position_ids(self) -> torch.Tensor:
+        if self.token_len:
+            return torch.tensor([[self.seq_len - 1]], dtype=torch.long)
+        return torch.arange(self.seq_len, dtype=torch.long).unsqueeze(0)
+
+# BGE is Embedding Model based Bert
+class BGEBlock(torch.nn.Module):
+    def __init__(self, block, block_id, hidden_size):
+        super().__init__()
+        self.block = block
+        self.block_id = block_id
+        self.hidden_size = hidden_size
+
+    def forward(self, hidden_states, attention_mask):
+        hidden_states = self.block(hidden_states, attention_mask)[0]
+        return hidden_states
+
+class bge(LLM):
+    def __init__(self, args):
+        super().__init__(args)
+        self.model_name = 'bge-large-zh'
+
+    def forward(self, input_ids, position_ids, attention_mask):
+        input_ids = input_ids.view(1, -1)
+        token_type_ids = (1 - attention_mask).view(1, -1)
+        hidden_states = self.embed(input_ids, token_type_ids, position_ids)[0].unsqueeze(0)
+        for i in range(self.block_nums):
+            hidden_states = self.blocks[i](hidden_states, attention_mask)
+        # hidden_states = self.lm(hidden_states) # sentence_embeddings not need
+        sentence_embeddings = hidden_states[:, 0]
+        sentence_embeddings = torch.nn.functional.normalize(sentence_embeddings, p=2, dim=1)
+        return sentence_embeddings
+
+    def response(self, query):
+        self.eval()
+        input_ids = self.tokenizer(query)['input_ids']
+        self.seq_len = len(input_ids)
+        input_ids = torch.tensor(input_ids)
+        position_ids = self.get_position_ids()
+        attention_mask = self.get_attention_mask()
+        res = self.forward(input_ids, position_ids, attention_mask)
+        return res
+
+    def load_model(self, model_path: str):
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        model = AutoModel.from_pretrained(model_path, trust_remote_code=True).float().eval()
+        transformer = model.encoder
+        self.lm_ = model.pooler
+        self.embed_ = model.embeddings
+        self.hidden_size = self.embed_.word_embeddings.weight.shape[-1]
+        self.blocks_ = transformer.layer
+        # some wrapper
+        self.stop_id = self.tokenizer.eos_token_id
+        self.block_nums = len(self.blocks_)
+        self.embed = self.embed_
+        self.lm = self.lm_
+        self.blocks = [BGEBlock(self.blocks_[i], i, self.hidden_size) for i in range(self.block_nums)]
+        # some config for export
+        self.model_dynamic_axes = {
+            "input_ids" : { 0: "seq_len" },
+            "position_ids" : { 1: "seq_len" },
+            "attention_mask" : { 3: "seq_len" }
+        }
+
+    def export(self):
+        model = self.eval()
+        self.seq_len = 3
+        input_ids = torch.arange(3, dtype=torch.long)
+        position_ids = self.get_position_ids()
+        attention_mask = self.get_attention_mask()
+        onnx_model = f'./{self.onnx_path}/bge.onnx'
+        torch.onnx.export(
+            model, (input_ids, position_ids, attention_mask),
+            onnx_model,
+            verbose=self.export_verbose,
+            input_names=[
+                'input_ids',
+                'position_ids',
+                'attention_mask'
+            ],
+            output_names=['sentence_embeddings'],
+            dynamic_axes=self.model_dynamic_axes,
+            do_constant_folding=True,
+            opset_version=15)
+        if not self.skip_slim:
+            slim(onnx_model, output_model=onnx_model)
+        if self.export_test:
+            self.seq_len = 4
+            position_ids = self.get_position_ids()
+            input_ids = torch.tensor([ 101,  872, 1962,  102 ], dtype=torch.long)
+            attention_mask = self.get_attention_mask()
+            # test
+            original_outs = model(input_ids, position_ids, attention_mask)
+            ort_session = ort.InferenceSession(onnx_model, providers=['CPUExecutionProvider'])
+            inputs = {
+                'input_ids' : input_ids.detach().numpy(),
+                'position_ids' : position_ids.detach().numpy(),
+                'attention_mask' : attention_mask.detach().numpy()
+            }
+            onnx_outs = ort_session.run(None, inputs)[0]
+            self.assert_equal(original_outs, onnx_outs)
+
+        token_str = None
+        if False: # save tokenizer in mnn
+            self.export_tokenizer()
+            token_path = os.path.join(self.onnx_path, "tokenizer.txt")
+            token_str = open(token_path, 'rt').read()
+
+        if self.export_mnn:
+            onnx2mnn(onnx_model, self.mnn_path, 8, True, bizCode=token_str)
+
+    def get_position_ids(self) -> torch.Tensor:
+        return torch.arange(self.seq_len, dtype=torch.long).unsqueeze(0)
+
+    def get_attention_mask(self) -> torch.Tensor:
+        return torch.ones([1, 1, 1, self.seq_len], dtype=torch.long)
+
+class LoraModule(torch.nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        self.onnx_path = args.onnx_path
+        self.mnn_path = args.mnn_path
+        self.export_mnn = args.export_mnn
+        import peft
+        lora_weight = peft.load_peft_weights(args.path)
+        for k, v in lora_weight.items():
+            k = k.replace('.', '/')
+            self.register_buffer(k, v.cpu())
+
+    def forward(self, dummpy):
+        return self._buffers
+
+    def export(self):
+        onnx_model = f'./{self.onnx_path}/lora.onnx'
+        torch.onnx.export(self.eval(), torch.tensor([]), onnx_model)
+        if self.export_mnn:
+            onnx2mnn(onnx_model, self.mnn_path)
 
 # baichuan2_13b
 class Baichuan2_13b_Block(torch.nn.Module):
@@ -665,7 +1049,6 @@ class Baichuan2_13b_Block(torch.nn.Module):
         if isinstance(presents, tuple):
             presents = torch.stack(presents)
         return hidden_states, presents
-
 
 class Baichuan2_13b_Chat(LLM):
     def __init__(self, args):
@@ -791,20 +1174,27 @@ class Baichuan2_13b_Chat(LLM):
             onnx_outs = ort_session.run(None, inputs)
             self.assert_equal(original_outs, onnx_outs)
 
-
 if __name__ == '__main__':
     llm_models = {
         'chatglm-6b': Chatglm_6b,
         'chatglm2-6b': Chatglm2_6b,
         'chatglm3-6b': Chatglm3_6b,
         'codegeex2-6b': Chatglm2_6b,
-        'Qwen-7B-Chat': Qwen_7b_Chat,
-        'Qwen-1_8B-Chat': Qwen_7b_Chat,
+        'Qwen-7B-Chat': Qwen_Chat,
+        'Qwen-1_8B-Chat': Qwen_Chat,
+        'Qwen-VL-Chat': Qwen_Chat,
         'Baichuan2-7B-Chat': Llama2_7b_Chat,
         'Baichuan2-13B-Chat': Baichuan2_13b_Chat,
-        'Llama-2-7b-chat-ms': Llama2_7b_Chat
+        'Llama-2-7b-chat-ms': Llama2_7b_Chat,
+        'internlm-chat-7b': Llama2_7b_Chat,
+        'TinyLlama-1_1B-Chat': Llama2_7b_Chat,
+        'Yi-6B-Chat': Llama2_7b_Chat,
+        'deepseek-llm-7b-chat': Llama2_7b_Chat,
+        'phi-2': phi_2,
+        'bge-large-zh': bge,
+        'lora': LoraModule
     }
-    parser = argparse.ArgumentParser(description='LLMExporter', formatter_class=argparse.RawTextHelpFormatter)
+    parser = argparse.ArgumentParser(description='llm_exporter', formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument('--path', type=str, default='THUDM/chatglm-6b', required=True,
                         help='path(`str` or `os.PathLike`):\nCan be either:'
                         '\n\t- A string, the *model id* of a pretrained model like `THUDM/chatglm-6b`. [TODO]'
@@ -813,7 +1203,9 @@ if __name__ == '__main__':
                         help='type(`str`, *optional*):'
                         '\n\tThe pretrain llm model type.'
                         )
-    parser.add_argument('--export_path', type=str, default='./onnx', help='export onnx model path, defaut is `./onnx`.')
+    parser.add_argument('--onnx_path', type=str, default='./onnx', help='export onnx model path, defaut is `./onnx`.')
+    parser.add_argument('--mnn_path', type=str, default='./mnn', help='export mnn model path, defaut is `./mnn`.')
+    parser.add_argument('--export_mnn', action='store_true', default=False, help='Whether or not to export mnn model after onnx.')
     parser.add_argument('--export_verbose', action='store_true', default=False, help='Whether or not to export onnx with verbose.')
     parser.add_argument('--export_test', action='store_true', help='Whether or not to export onnx with test using onnxruntime.')
     parser.add_argument('--test', type=str, help='test model inference with query `TEST`.')
@@ -826,10 +1218,12 @@ if __name__ == '__main__':
                         )
     parser.add_argument('--export_token', action='store_true', help='export llm tokenizer to a txt file.')
     parser.add_argument('--export_embed', action='store_true', help='export llm embedding to an `onnx` model.')
+    parser.add_argument('--export_visual', action='store_true', help='export llm visual model to an `onnx` model.')
     parser.add_argument('--export_lm', action='store_true', help='export llm lm_head to an `onnx` model.')
     parser.add_argument('--export_block', type=int, help='export llm block [id] to an `onnx` model.')
     parser.add_argument('--export_blocks', action='store_true', help='export llm all blocks to `onnx` models.')
     parser.add_argument('--embed_bf16', action='store_true', help='using `bfloat16` replace `float32` in embedding.')
+    parser.add_argument('--skip_slim', action='store_true', help='Whether or not to skip onnx-slim.')
 
 
     args = parser.parse_args()
@@ -855,13 +1249,15 @@ if __name__ == '__main__':
 
     if args.export:
         llm_exporter.export()
-        llm_exporter.verify_load_via_onnx()
 
     if args.export_token:
         llm_exporter.export_tokenizer()
 
     if args.export_embed or args.export_split:
         llm_exporter.export_embed()
+
+    if args.export_visual or args.export_split:
+        llm_exporter.export_visual()
 
     if args.export_lm or args.export_split:
         llm_exporter.export_lm()
